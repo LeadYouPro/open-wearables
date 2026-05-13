@@ -18,6 +18,7 @@ HEALTH_SCORE_RANGES: dict[HealthScoreCategory, dict[ProviderName, ScoreRange]] =
     },
     HealthScoreCategory.READINESS: {
         ProviderName.OURA: ScoreRange(1, 100),
+        ProviderName.POLAR: ScoreRange(0, 10),  # SleepWise alertness grade
     },
     HealthScoreCategory.ACTIVITY: {
         ProviderName.OURA: ScoreRange(1, 100),

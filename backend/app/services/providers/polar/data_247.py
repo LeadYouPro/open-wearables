@@ -1,8 +1,10 @@
-from datetime import date, datetime, time, timedelta
+from collections.abc import Callable
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+from app.config import settings
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -15,10 +17,31 @@ from app.schemas.model_crud.activities import (
     SleepStage,
     TimeSeriesSampleCreate,
 )
-from app.schemas.providers.polar import CardioLoadJSON, ContinuousHeartRateJSON, DailyActivityJSON, NightlyRechargeJSON, SleepJSON
+from app.schemas.providers.polar import (
+    CardioLoadJSON,
+    ContinuousHeartRateJSON,
+    DailyActivityJSON,
+    NightlyRechargeJSON,
+    SleepJSON,
+)
+from app.schemas.providers.polar.elixir import (
+    BodyTemperaturePeriodJSON,
+    EcgTestResultJSON,
+    SkinTemperatureJSON,
+    Spo2TestResultJSON,
+)
+from app.schemas.providers.polar.elixir.body_temperature import TemperatureMeasurementType
+from app.schemas.providers.polar.elixir.spo2 import Spo2TestStatus
+from app.schemas.providers.polar.sleepwise import AlertnessJSON, CircadianBedtimeJSON
+from app.schemas.providers.polar.sleepwise.alertness import GradeClassification, GradeType, SleepInertia
+from app.schemas.providers.polar.sleepwise.circadian_bedtime import CircadianBedtimeQuality, CircadianBedtimeResultType
+from app.services.event_record_service import event_record_service
+from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.timeseries_service import timeseries_service
+from app.utils.structured_logging import log_structured
 
 
 class Polar247Data(Base247DataTemplate):
@@ -37,6 +60,37 @@ class Polar247Data(Base247DataTemplate):
         3: "usual",
         4: "above usual",
         5: "much above usual",
+    }
+
+    _GRADE_CLASSIFICATION_LABELS: dict[GradeClassification, str] = {
+        GradeClassification.WEAK: "weak",
+        GradeClassification.FAIR: "fair",
+        GradeClassification.STRONG: "strong",
+        GradeClassification.EXCELLENT: "excellent",
+    }
+
+    _SLEEP_INERTIA_LABELS: dict[SleepInertia, str] = {
+        SleepInertia.NO_INERTIA: "no inertia",
+        SleepInertia.MILD: "mild",
+        SleepInertia.MODERATE: "moderate",
+        SleepInertia.HEAVY: "heavy",
+    }
+
+    _CIRCADIAN_QUALITY_VALUES: dict[CircadianBedtimeQuality, int] = {
+        CircadianBedtimeQuality.WEAK: 1,
+        CircadianBedtimeQuality.COMPROMISED: 2,
+        CircadianBedtimeQuality.CLEARLY_RECOGNIZABLE: 3,
+    }
+
+    _CIRCADIAN_QUALITY_LABELS: dict[CircadianBedtimeQuality, str] = {
+        CircadianBedtimeQuality.WEAK: "weak",
+        CircadianBedtimeQuality.COMPROMISED: "compromised",
+        CircadianBedtimeQuality.CLEARLY_RECOGNIZABLE: "clearly recognizable",
+    }
+
+    _BODY_TEMP_SERIES_TYPE: dict[TemperatureMeasurementType, SeriesType] = {
+        TemperatureMeasurementType.SKIN_TEMPERATURE: SeriesType.skin_temperature,
+        TemperatureMeasurementType.CORE_TEMPERATURE: SeriesType.body_temperature,
     }
 
     _HYPNOGRAM_STAGE_MAP: dict[int, SleepStageType] = {
@@ -495,6 +549,447 @@ class Polar247Data(Base247DataTemplate):
             recorded_at=datetime.fromisoformat(parsed.date),
             components=components or None,
         )
+
+    # -------------------------------------------------------------------------
+    # SleepWise — Alertness: GET /v3/users/sleepwise/alertness
+    # -------------------------------------------------------------------------
+
+    def get_alertness_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "from": start_time.date().isoformat(),
+            "to": end_time.date().isoformat(),
+        }
+        response = self._make_api_request(db, user_id, "/v3/users/sleepwise/alertness", params=params)
+        return response if isinstance(response, list) else []
+
+    def normalize_alertness(
+        self,
+        raw: dict[str, Any],
+        user_id: UUID,
+    ) -> HealthScoreCreate | None:
+        parsed = AlertnessJSON.model_validate(raw)
+
+        # Only score primary results — additional are supplementary assessments
+        if parsed.grade is None or parsed.grade_type != GradeType.PRIMARY:
+            return None
+        if not parsed.period_start_time:
+            return None
+
+        components: dict[str, ScoreComponent] = {}
+        if parsed.grade_validity_seconds is not None:
+            components["grade_validity_seconds"] = ScoreComponent(value=parsed.grade_validity_seconds)
+        if parsed.sleep_inertia is not None:
+            components["sleep_inertia"] = ScoreComponent(
+                value=None,
+                qualifier=self._SLEEP_INERTIA_LABELS.get(parsed.sleep_inertia),
+            )
+        if parsed.sleep_type is not None:
+            components["sleep_type"] = ScoreComponent(value=None, qualifier=parsed.sleep_type.value)
+
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user_id,
+            provider=ProviderName.POLAR,
+            category=HealthScoreCategory.READINESS,
+            value=parsed.grade,
+            qualifier=self._GRADE_CLASSIFICATION_LABELS.get(parsed.grade_classification)
+            if parsed.grade_classification
+            else None,
+            recorded_at=datetime.fromisoformat(parsed.period_start_time),
+            components=components or None,
+        )
+
+    # -------------------------------------------------------------------------
+    # SleepWise — Circadian Bedtime: GET /v3/users/sleepwise/circadian-bedtime
+    # -------------------------------------------------------------------------
+
+    def get_circadian_bedtime_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "from": start_time.date().isoformat(),
+            "to": end_time.date().isoformat(),
+        }
+        response = self._make_api_request(db, user_id, "/v3/users/sleepwise/circadian-bedtime", params=params)
+        return response if isinstance(response, list) else []
+
+    def normalize_circadian_bedtime(
+        self,
+        raw: dict[str, Any],
+        user_id: UUID,
+    ) -> HealthScoreCreate | None:
+        parsed = CircadianBedtimeJSON.model_validate(raw)
+
+        if parsed.quality is None or parsed.quality == CircadianBedtimeQuality.UNKNOWN:
+            return None
+        if not parsed.period_start_time:
+            return None
+
+        numeric_quality = self._CIRCADIAN_QUALITY_VALUES.get(parsed.quality)
+
+        components: dict[str, ScoreComponent] = {}
+        if parsed.sleep_gate_start_time and parsed.sleep_gate_end_time:
+            components["sleep_gate_start"] = ScoreComponent(value=None, qualifier=parsed.sleep_gate_start_time)
+            components["sleep_gate_end"] = ScoreComponent(value=None, qualifier=parsed.sleep_gate_end_time)
+        if parsed.result_type is not None and parsed.result_type != CircadianBedtimeResultType.UNKNOWN:
+            components["result_type"] = ScoreComponent(value=None, qualifier=parsed.result_type.value)
+
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user_id,
+            provider=ProviderName.POLAR,
+            category=HealthScoreCategory.SLEEP,
+            value=numeric_quality,
+            qualifier=self._CIRCADIAN_QUALITY_LABELS.get(parsed.quality),
+            recorded_at=datetime.fromisoformat(parsed.period_start_time),
+            components=components or None,
+        )
+
+    # -------------------------------------------------------------------------
+    # Elixir — Body Temperature: GET /v3/users/body-temperature
+    # -------------------------------------------------------------------------
+
+    def get_body_temperature_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        params = {"from": start_time.date().isoformat(), "to": end_time.date().isoformat()}
+        response = self._make_api_request(db, user_id, "/v3/users/body-temperature", params=params)
+        return response if isinstance(response, list) else []
+
+    def normalize_body_temperature(
+        self,
+        raw: dict[str, Any],
+        user_id: UUID,
+    ) -> list[TimeSeriesSampleCreate]:
+        parsed = BodyTemperaturePeriodJSON.model_validate(raw)
+        if not parsed.samples or not parsed.start_time or not parsed.measurement_type:
+            return []
+
+        series_type = self._BODY_TEMP_SERIES_TYPE.get(parsed.measurement_type)
+        if series_type is None:
+            return []
+
+        anchor = datetime.fromisoformat(parsed.start_time)
+        return [
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                provider=ProviderName.POLAR,
+                source=ProviderName.POLAR,
+                recorded_at=anchor + timedelta(milliseconds=s.recording_time_delta_milliseconds or 0),
+                value=s.temperature_celsius,
+                series_type=series_type,
+            )
+            for s in parsed.samples
+            if s.temperature_celsius is not None
+        ]
+
+    # -------------------------------------------------------------------------
+    # Elixir — Sleep Skin Temperature: GET /v3/users/sleep-skin-temperature
+    # -------------------------------------------------------------------------
+
+    def get_sleep_skin_temperature_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        params = {"from": start_time.date().isoformat(), "to": end_time.date().isoformat()}
+        response = self._make_api_request(db, user_id, "/v3/users/sleep-skin-temperature", params=params)
+        return response if isinstance(response, list) else []
+
+    def normalize_sleep_skin_temperature(
+        self,
+        raw: dict[str, Any],
+        user_id: UUID,
+    ) -> list[TimeSeriesSampleCreate]:
+        parsed = SkinTemperatureJSON.model_validate(raw)
+        if not parsed.sleep_date:
+            return []
+
+        recorded_at = datetime.fromisoformat(parsed.sleep_date)
+        samples: list[TimeSeriesSampleCreate] = []
+
+        if parsed.sleep_time_skin_temperature_celsius is not None:
+            samples.append(TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                provider=ProviderName.POLAR,
+                source=ProviderName.POLAR,
+                recorded_at=recorded_at,
+                value=parsed.sleep_time_skin_temperature_celsius,
+                series_type=SeriesType.skin_temperature,
+            ))
+        if parsed.deviation_from_baseline_celsius is not None:
+            samples.append(TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                provider=ProviderName.POLAR,
+                source=ProviderName.POLAR,
+                recorded_at=recorded_at,
+                value=parsed.deviation_from_baseline_celsius,
+                series_type=SeriesType.skin_temperature_deviation,
+            ))
+        return samples
+
+    # -------------------------------------------------------------------------
+    # Elixir — SpO2: GET /v3/users/spo2
+    # -------------------------------------------------------------------------
+
+    def get_spo2_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        params = {"from": start_time.date().isoformat(), "to": end_time.date().isoformat()}
+        response = self._make_api_request(db, user_id, "/v3/users/spo2", params=params)
+        return response if isinstance(response, list) else []
+
+    def normalize_spo2(
+        self,
+        raw: dict[str, Any],
+        user_id: UUID,
+    ) -> list[TimeSeriesSampleCreate]:
+        parsed = Spo2TestResultJSON.model_validate(raw)
+        if parsed.test_status != Spo2TestStatus.PASSED or parsed.test_time is None:
+            return []
+
+        recorded_at = datetime.fromtimestamp(parsed.test_time, tz=timezone.utc)
+        samples: list[TimeSeriesSampleCreate] = []
+
+        if parsed.blood_oxygen_percent is not None:
+            samples.append(TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                provider=ProviderName.POLAR,
+                source=ProviderName.POLAR,
+                recorded_at=recorded_at,
+                value=parsed.blood_oxygen_percent,
+                series_type=SeriesType.oxygen_saturation,
+            ))
+        if parsed.heart_rate_variability_ms is not None:
+            samples.append(TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                provider=ProviderName.POLAR,
+                source=ProviderName.POLAR,
+                recorded_at=recorded_at,
+                value=parsed.heart_rate_variability_ms,
+                series_type=SeriesType.heart_rate_variability_rmssd,
+            ))
+        return samples
+
+    # -------------------------------------------------------------------------
+    # Elixir — Wrist ECG: GET /v3/users/wrist-ecg
+    # -------------------------------------------------------------------------
+
+    def get_wrist_ecg_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        params = {"from": start_time.date().isoformat(), "to": end_time.date().isoformat()}
+        response = self._make_api_request(db, user_id, "/v3/users/wrist-ecg", params=params)
+        return response if isinstance(response, list) else []
+
+    def normalize_wrist_ecg(
+        self,
+        raw: dict[str, Any],
+        user_id: UUID,
+    ) -> list[TimeSeriesSampleCreate]:
+        parsed = EcgTestResultJSON.model_validate(raw)
+        if parsed.test_time is None:
+            return []
+
+        recorded_at = datetime.fromtimestamp(parsed.test_time, tz=timezone.utc)
+        samples: list[TimeSeriesSampleCreate] = []
+
+        if parsed.heart_rate_variability_ms is not None:
+            samples.append(TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                provider=ProviderName.POLAR,
+                source=ProviderName.POLAR,
+                recorded_at=recorded_at,
+                value=parsed.heart_rate_variability_ms,
+                series_type=SeriesType.heart_rate_variability_rmssd,
+            ))
+        if parsed.average_heart_rate_bpm is not None:
+            samples.append(TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                provider=ProviderName.POLAR,
+                source=ProviderName.POLAR,
+                recorded_at=recorded_at,
+                value=parsed.average_heart_rate_bpm,
+                series_type=SeriesType.heart_rate,
+            ))
+        return samples
+
+    # -------------------------------------------------------------------------
+    # Persistence helpers
+    # -------------------------------------------------------------------------
+
+    def _save_timeseries(self, db: DbSession, samples: list[TimeSeriesSampleCreate]) -> int:
+        if samples:
+            timeseries_service.bulk_create_samples(db, samples)
+        return len(samples)
+
+    def _save_scores(self, db: DbSession, scores: list[HealthScoreCreate]) -> int:
+        if scores:
+            health_score_service.bulk_create(db, scores)
+        return len(scores)
+
+    def _save_sleep(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> int:
+        raw_items = self.get_sleep_data(db, user_id, start_time, end_time)
+        count = 0
+        scores: list[HealthScoreCreate] = []
+        hr_samples: list[TimeSeriesSampleCreate] = []
+
+        for raw in raw_items:
+            try:
+                record, detail, score, hr = self.normalize_sleep(raw, user_id)
+                event_record_service.create_or_merge_sleep(
+                    db, user_id, record, detail, settings.sleep_end_gap_minutes
+                )
+                count += 1
+                if score:
+                    scores.append(score)
+                hr_samples.extend(hr)
+            except Exception as e:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    f"Failed to save Polar sleep record: {e}",
+                    provider="polar",
+                    task="_save_sleep",
+                    user_id=str(user_id),
+                )
+
+        self._save_scores(db, scores)
+        self._save_timeseries(db, hr_samples)
+        return count
+
+    # -------------------------------------------------------------------------
+    # Load and save all — entry point for sync_vendor_data task
+    # -------------------------------------------------------------------------
+
+    def load_and_save_all(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime | str | None = None,
+        end_time: datetime | str | None = None,
+        is_first_sync: bool = False,
+    ) -> dict[str, int]:
+        if isinstance(start_time, str):
+            start_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        if isinstance(end_time, str):
+            end_time = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        if not start_time:
+            start_time = datetime.now(timezone.utc) - timedelta(days=30)
+        if not end_time:
+            end_time = datetime.now(timezone.utc)
+
+        tasks: dict[str, Callable[[], int]] = {
+            "sleep": lambda: self._save_sleep(db, user_id, start_time, end_time),
+            "daily_activity": lambda: self._save_timeseries(db, [
+                s
+                for raw in self.get_daily_activity_statistics(db, user_id, start_time, end_time)
+                for s in self.normalize_daily_activity(raw, user_id)
+            ]),
+            "continuous_hr": lambda: self._save_timeseries(db, [
+                s
+                for raw in self.get_continuous_hr_data(db, user_id, start_time, end_time)
+                for s in self.normalize_continuous_hr(raw, user_id)
+            ]),
+            "cardio_load": lambda: self._save_scores(db, [
+                score
+                for raw in self.get_cardio_load_data(db, user_id, start_time, end_time)
+                if (score := self.normalize_cardio_load(raw, user_id)) is not None
+            ]),
+            "nightly_recharge": lambda: self._save_scores(db, [
+                score
+                for raw in self.get_nightly_recharge_data(db, user_id, start_time, end_time)
+                if (score := self.normalize_nightly_recharge(raw, user_id)) is not None
+            ]),
+            "alertness": lambda: self._save_scores(db, [
+                score
+                for raw in self.get_alertness_data(db, user_id, start_time, end_time)
+                if (score := self.normalize_alertness(raw, user_id)) is not None
+            ]),
+            "circadian_bedtime": lambda: self._save_scores(db, [
+                score
+                for raw in self.get_circadian_bedtime_data(db, user_id, start_time, end_time)
+                if (score := self.normalize_circadian_bedtime(raw, user_id)) is not None
+            ]),
+            "body_temperature": lambda: self._save_timeseries(db, [
+                s
+                for raw in self.get_body_temperature_data(db, user_id, start_time, end_time)
+                for s in self.normalize_body_temperature(raw, user_id)
+            ]),
+            "sleep_skin_temperature": lambda: self._save_timeseries(db, [
+                s
+                for raw in self.get_sleep_skin_temperature_data(db, user_id, start_time, end_time)
+                for s in self.normalize_sleep_skin_temperature(raw, user_id)
+            ]),
+            "spo2": lambda: self._save_timeseries(db, [
+                s
+                for raw in self.get_spo2_data(db, user_id, start_time, end_time)
+                for s in self.normalize_spo2(raw, user_id)
+            ]),
+            "wrist_ecg": lambda: self._save_timeseries(db, [
+                s
+                for raw in self.get_wrist_ecg_data(db, user_id, start_time, end_time)
+                for s in self.normalize_wrist_ecg(raw, user_id)
+            ]),
+        }
+
+        results: dict[str, int] = {}
+        for data_type, fn in tasks.items():
+            try:
+                results[data_type] = fn()
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                results[data_type] = 0
+                log_structured(
+                    self.logger,
+                    "error",
+                    f"Failed to sync {data_type} data",
+                    provider="polar",
+                    task="load_and_save_all",
+                    data_type=data_type,
+                    user_id=str(user_id),
+                    error=str(e),
+                )
+
+        return results
 
     # -------------------------------------------------------------------------
     # Not implemented — Polar recovery and activity samples map to other modules
