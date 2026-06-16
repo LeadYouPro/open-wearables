@@ -14,6 +14,7 @@ from celery import Task, shared_task
 from fastapi import HTTPException
 
 from app.database import SessionLocal
+from app.schemas.enums.provider import ProviderName
 from app.services.providers.factory import ProviderFactory
 from app.utils.structured_logging import log_structured
 
@@ -22,6 +23,41 @@ logger = getLogger(__name__)
 # Upstream 4xx where retrying can't recover the object. 401 (token refresh) and
 # 429 (rate limit) are excluded — those still benefit from a retry.
 _NONRETRIABLE_UPSTREAM_STATUSES = frozenset({400, 403, 404, 410, 422})
+
+
+def extract_payload_user_id(provider_name: str, payload: dict[str, Any]) -> str | None:
+    """Best-effort extraction of the provider's user identifier from a webhook payload.
+
+    The key differs per provider (Oura/Whoop/Polar use ``user_id``, Strava uses
+    ``owner_id``, Suunto uses ``username``, Garmin nests ``userId`` per item).
+    Returns ``None`` when no identifier is present.
+    """
+    try:
+        provider = ProviderName(provider_name)
+    except ValueError:
+        return None
+
+    match provider:
+        case ProviderName.OURA | ProviderName.WHOOP | ProviderName.POLAR:
+            uid = payload.get("user_id")
+            return str(uid) if uid is not None else None
+        case ProviderName.STRAVA:
+            uid = payload.get("owner_id")
+            return str(uid) if uid is not None else None
+        case ProviderName.SUUNTO:
+            return payload.get("username")
+        case ProviderName.GARMIN:
+            # Garmin batches items under data-type keys; userId lives per item.
+            user_ids = {
+                str(item["userId"])
+                for items in payload.values()
+                if isinstance(items, list)
+                for item in items
+                if isinstance(item, dict) and item.get("userId")
+            }
+            return ",".join(sorted(user_ids)) or None
+        case _:
+            return None
 
 
 @shared_task(
@@ -55,6 +91,7 @@ def process_webhook_push(
             "Webhook push task aborted — configuration error",
             provider=provider_name,
             trace_id=request_trace_id,
+            payload_user_id=extract_payload_user_id(provider_name, payload),
             error=str(exc),
         )
         raise
@@ -95,6 +132,7 @@ def process_webhook_push(
             "Webhook push task failed, scheduling retry",
             provider=provider_name,
             trace_id=request_trace_id,
+            payload_user_id=extract_payload_user_id(provider_name, payload),
             error=str(exc),
             attempt=self.request.retries,
             max_retries=self.max_retries,
